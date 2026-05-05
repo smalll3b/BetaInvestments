@@ -17,6 +17,12 @@ This folder contains a small PHP + MySQL demo built for a security-focused cours
 mysql -u root -p < schema.sql
 ```
 
+If you already have an existing database, apply the encrypted shadow-column migration first:
+
+```bash
+mysql -u root -p beta_investments < 20260505_add_numeric_enc_columns.sql
+```
+
 2. Configure environment variables for the PHP app:
 
 ```bash
@@ -33,16 +39,32 @@ export APP_SESSION_NAME=beta_investments_session
 
 4. Open `login.php`, register a user, then sign in and use `trade.php`.
 
+## Optional: HTTPS/TLS reverse proxy (Scheme A)
+
+If you want to demonstrate `in-transit` protection, use the Nginx reverse proxy in `https/`:
+
+```bash
+cd https
+bash generate-cert.sh
+docker compose up -d
+```
+
+Then open `https://beta.local/login.php`.
+
+When starting the PHP container, set `APP_HTTPS_HOST=beta.local` so the app knows which HTTPS host to redirect to when a request is not already secure.
+
 ## Security features demonstrated
 
 - `password_hash()` and `password_verify()` for adaptive password hashing.
 - Optional TOTP-based 2FA for stronger authentication.
 - AES-256-GCM encryption for sensitive fields at rest.
+- Encrypted shadow columns for monetary values so sensitive numbers are stored twice: as DECIMAL for arithmetic and as AES-256-GCM ciphertext for at-rest protection.
 - PDO prepared statements to resist SQL injection.
 - CSRF tokens on all POST actions.
 - `htmlspecialchars()` output escaping to prevent XSS.
 - Session cookie hardening and session ID regeneration to reduce fixation/hijacking risk.
 - Transactional trade updates to keep balances and holdings consistent.
+- HTTPS/TLS reverse proxy support for protecting data in transit.
 
 ## Notes for your coursework demo
 

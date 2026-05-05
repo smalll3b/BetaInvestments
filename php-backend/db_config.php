@@ -35,8 +35,14 @@ function start_secure_session(): void
         return;
     }
 
-    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['SERVER_PORT'] ?? null) === '443');
+    $https = is_https_request();
+
+    if (PHP_SAPI !== 'cli' && !$https && getenv('APP_REQUIRE_HTTPS') !== '0') {
+        $canonicalHost = canonical_https_host();
+        $requestUri = $_SERVER['REQUEST_URI'] ?? '/';
+        header('Location: https://' . $canonicalHost . $requestUri, true, 301);
+        exit;
+    }
 
     session_name(getenv('APP_SESSION_NAME') ?: 'beta_investments_session');
     session_set_cookie_params([
@@ -49,6 +55,36 @@ function start_secure_session(): void
     ]);
 
     session_start();
+}
+
+/**
+ * Determine whether the current request arrived over HTTPS, including a TLS
+ * reverse-proxy termination that forwards X-Forwarded-Proto.
+ */
+function is_https_request(): bool
+{
+    $https = (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || (($_SERVER['SERVER_PORT'] ?? null) === '443');
+
+    $forwardedProto = strtolower(trim((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')));
+    $forwardedSsl = strtolower(trim((string) ($_SERVER['HTTP_X_FORWARDED_SSL'] ?? '')));
+
+    return $https || $forwardedProto === 'https' || $forwardedSsl === 'on';
+}
+
+/**
+ * Build the canonical host used when redirecting HTTP traffic to HTTPS.
+ */
+function canonical_https_host(): string
+{
+    $host = getenv('APP_HTTPS_HOST');
+    if (!is_string($host) || trim($host) === '') {
+        $host = (string) ($_SERVER['HTTP_HOST'] ?? 'localhost');
+    }
+
+    $host = trim($host);
+    $host = preg_replace('/:\d+$/', '', $host) ?? $host;
+    return $host !== '' ? $host : 'localhost';
 }
 
 start_secure_session();
@@ -207,6 +243,79 @@ function decrypt_sensitive_value(?string $payload): ?string
     );
 
     return $plaintext === false ? null : $plaintext;
+}
+
+/**
+ * Normalize a numeric value to a fixed-scale decimal string.
+ *
+ * This keeps the encrypted payload stable and avoids scientific notation.
+ */
+function normalize_decimal_string(mixed $value, int $scale = 2): ?string
+{
+    if ($value === null || $scale < 0) {
+        return null;
+    }
+
+    if (!is_int($value) && !is_float($value) && !is_string($value)) {
+        return null;
+    }
+
+    $stringValue = is_string($value) ? trim($value) : (string) $value;
+    if ($stringValue === '' || !preg_match('/^-?\d+(?:\.\d+)?$/', $stringValue)) {
+        return null;
+    }
+
+    $negative = str_starts_with($stringValue, '-');
+    if ($negative) {
+        $stringValue = substr($stringValue, 1);
+    }
+
+    [$integerPart, $fractionalPart] = array_pad(explode('.', $stringValue, 2), 2, '');
+    $integerPart = ltrim($integerPart, '0');
+    if ($integerPart === '') {
+        $integerPart = '0';
+    }
+
+    $fractionalPart = substr(str_pad($fractionalPart, $scale, '0'), 0, $scale);
+    $normalized = $scale > 0 ? $integerPart . '.' . $fractionalPart : $integerPart;
+    $isZero = $integerPart === '0' && trim($fractionalPart, '0') === '';
+
+    return ($negative && !$isZero ? '-' : '') . $normalized;
+}
+
+/**
+ * Encrypt a numeric value after canonicalizing it to a decimal string.
+ */
+function encrypt_numeric_value(mixed $value, int $scale = 2): ?string
+{
+    $normalized = normalize_decimal_string($value, $scale);
+    if ($normalized === null) {
+        return null;
+    }
+
+    return encrypt_sensitive_value($normalized);
+}
+
+/**
+ * Decrypt a numeric payload back into a canonical decimal string.
+ */
+function decrypt_numeric_value(?string $payload, int $scale = 2): ?string
+{
+    $plaintext = decrypt_sensitive_value($payload);
+    if ($plaintext === null) {
+        return null;
+    }
+
+    return normalize_decimal_string($plaintext, $scale);
+}
+
+/**
+ * Convenience helper when a float is specifically needed in application logic.
+ */
+function decrypt_numeric_float_value(?string $payload, int $scale = 2): ?float
+{
+    $normalized = decrypt_numeric_value($payload, $scale);
+    return $normalized === null ? null : (float) $normalized;
 }
 
 /**

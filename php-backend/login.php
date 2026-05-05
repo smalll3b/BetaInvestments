@@ -67,15 +67,17 @@ if (is_post()) {
                 }
 
                 $stmt = $pdo->prepare(
-                    'INSERT INTO users (username, email, password_hash, role, cash_balance, two_factor_enabled, totp_secret_enc, failed_login_attempts, locked_until, created_at, updated_at)
-                     VALUES (:username, :email, :password_hash, :role, :cash_balance, :two_factor_enabled, :totp_secret_enc, 0, NULL, NOW(), NOW())'
+                    'INSERT INTO users (username, email, password_hash, role, cash_balance, cash_balance_enc, two_factor_enabled, totp_secret_enc, failed_login_attempts, locked_until, created_at, updated_at)
+                     VALUES (:username, :email, :password_hash, :role, :cash_balance, :cash_balance_enc, :two_factor_enabled, :totp_secret_enc, 0, NULL, NOW(), NOW())'
                 );
+                $startingBalance = '100000.00';
                 $stmt->execute([
                     ':username' => $username,
                     ':email' => $email,
                     ':password_hash' => $passwordHash,
                     ':role' => 'user',
-                    ':cash_balance' => '100000.00',
+                    ':cash_balance' => $startingBalance,
+                    ':cash_balance_enc' => encrypt_numeric_value($startingBalance),
                     ':two_factor_enabled' => $enable2fa ? 1 : 0,
                     ':totp_secret_enc' => $totpSecret ? encrypt_sensitive_value($totpSecret) : null,
                 ]);
@@ -96,6 +98,8 @@ if (is_post()) {
                 $identifier = strtolower(trim((string) ($_POST['identifier'] ?? '')));
                 $password = (string) ($_POST['password'] ?? '');
                 $totpCode = trim((string) ($_POST['totp_code'] ?? ''));
+
+                audit_event($pdo, null, 'login_attempt', 'Login attempt submitted for identifier: ' . ($identifier !== '' ? $identifier : '[empty]'));
 
                 if ($identifier === '' || $password === '') {
                     throw new RuntimeException('Login failed.');

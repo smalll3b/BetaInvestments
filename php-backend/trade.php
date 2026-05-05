@@ -22,9 +22,16 @@ if (isset($_GET['logout']) && $_GET['logout'] === '1') {
 }
 
 // Load the current account so the demo can show available cash and demonstrate row-level ownership checks.
-$accountStmt = $pdo->prepare('SELECT id, username, role, cash_balance FROM users WHERE id = :id LIMIT 1');
+$accountStmt = $pdo->prepare('SELECT id, username, role, cash_balance, cash_balance_enc FROM users WHERE id = :id LIMIT 1');
 $accountStmt->execute([':id' => $userId]);
 $account = $accountStmt->fetch();
+
+if ($account && !empty($account['cash_balance_enc'])) {
+    $decryptedBalance = decrypt_numeric_float_value((string) $account['cash_balance_enc']);
+    if ($decryptedBalance !== null) {
+        $account['cash_balance'] = $decryptedBalance;
+    }
+}
 
 if (!$account) {
     // If the session survives but the user row was removed, force re-authentication.
@@ -68,7 +75,7 @@ if (is_post()) {
             $price = (float) $stock['current_price'];
             $total = round($price * $quantity, 2);
 
-            $userStmt = $pdo->prepare('SELECT id, cash_balance FROM users WHERE id = :id FOR UPDATE');
+            $userStmt = $pdo->prepare('SELECT id, cash_balance, cash_balance_enc FROM users WHERE id = :id FOR UPDATE');
             $userStmt->execute([':id' => $userId]);
             $lockedUser = $userStmt->fetch();
 
@@ -76,15 +83,30 @@ if (is_post()) {
                 throw new RuntimeException('Account not found.');
             }
 
+            $cashBalance = (float) $lockedUser['cash_balance'];
+            if (!empty($lockedUser['cash_balance_enc'])) {
+                $decryptedBalance = decrypt_numeric_float_value((string) $lockedUser['cash_balance_enc']);
+                if ($decryptedBalance !== null) {
+                    $cashBalance = $decryptedBalance;
+                }
+            }
+
+            $newBalance = $tradeType === 'buy'
+                ? round($cashBalance - $total, 2)
+                : round($cashBalance + $total, 2);
+
             if ($tradeType === 'buy') {
-                $cashBalance = (float) $lockedUser['cash_balance'];
                 if ($cashBalance < $total) {
                     throw new RuntimeException('Insufficient cash balance for this trade.');
                 }
 
                 // Deduct the simulated cash balance after validating affordability.
-                $balanceUpdate = $pdo->prepare('UPDATE users SET cash_balance = cash_balance - :total, updated_at = NOW() WHERE id = :id');
-                $balanceUpdate->execute([':total' => $total, ':id' => $userId]);
+                $balanceUpdate = $pdo->prepare('UPDATE users SET cash_balance = :cash_balance, cash_balance_enc = :cash_balance_enc, updated_at = NOW() WHERE id = :id');
+                $balanceUpdate->execute([
+                    ':cash_balance' => $newBalance,
+                    ':cash_balance_enc' => encrypt_numeric_value($newBalance),
+                    ':id' => $userId,
+                ]);
 
                 // Upsert the owned quantity so the portfolio reflects the simulated position.
                 $holdingStmt = $pdo->prepare(
@@ -117,8 +139,12 @@ if (is_post()) {
                     throw new RuntimeException('You do not own enough shares to sell this quantity.');
                 }
 
-                $balanceUpdate = $pdo->prepare('UPDATE users SET cash_balance = cash_balance + :total, updated_at = NOW() WHERE id = :id');
-                $balanceUpdate->execute([':total' => $total, ':id' => $userId]);
+                $balanceUpdate = $pdo->prepare('UPDATE users SET cash_balance = :cash_balance, cash_balance_enc = :cash_balance_enc, updated_at = NOW() WHERE id = :id');
+                $balanceUpdate->execute([
+                    ':cash_balance' => $newBalance,
+                    ':cash_balance_enc' => encrypt_numeric_value($newBalance),
+                    ':id' => $userId,
+                ]);
 
                 if ($owned === $quantity) {
                     $deleteHolding = $pdo->prepare('DELETE FROM user_portfolio WHERE user_id = :user_id AND symbol = :symbol');
@@ -132,26 +158,42 @@ if (is_post()) {
             }
 
             $tradeStmt = $pdo->prepare(
-                'INSERT INTO trades (user_id, symbol, trade_type, quantity, price, total_amount, status, created_at)
-                 VALUES (:user_id, :symbol, :trade_type, :quantity, :price, :total_amount, :status, NOW())'
+                'INSERT INTO trades (user_id, symbol, trade_type, quantity, price, price_enc, total_amount, total_amount_enc, status, created_at)
+                 VALUES (:user_id, :symbol, :trade_type, :quantity, :price, :price_enc, :total_amount, :total_amount_enc, :status, NOW())'
             );
+            $priceEnc = encrypt_numeric_value($price);
+            $totalEnc = encrypt_numeric_value($total);
+            if ($priceEnc === null || $totalEnc === null) {
+                throw new RuntimeException('Unable to encrypt trade values.');
+            }
             $tradeStmt->execute([
                 ':user_id' => $userId,
                 ':symbol' => $symbol,
                 ':trade_type' => $tradeType,
                 ':quantity' => $quantity,
                 ':price' => $price,
+                ':price_enc' => $priceEnc,
                 ':total_amount' => $total,
+                ':total_amount_enc' => $totalEnc,
                 ':status' => 'filled',
             ]);
 
             $pdo->commit();
             audit_event($pdo, $userId, 'trade_' . $tradeType, sprintf('%s %d %s at %.2f', strtoupper($tradeType), $quantity, $symbol, $price));
+            if ($total >= 10000.00) {
+                audit_event($pdo, $userId, 'large_trade', sprintf('Large trade: %s %d %s at %.2f total %.2f', strtoupper($tradeType), $quantity, $symbol, $price, $total));
+            }
             $success = sprintf('%s order executed: %d %s at £%.2f each (total £%.2f).', ucfirst($tradeType), $quantity, $symbol, $price, $total);
 
             // Refresh the account snapshot so the page shows the new balance after a successful trade.
             $accountStmt->execute([':id' => $userId]);
             $account = $accountStmt->fetch();
+            if ($account && !empty($account['cash_balance_enc'])) {
+                $decryptedBalance = decrypt_numeric_float_value((string) $account['cash_balance_enc']);
+                if ($decryptedBalance !== null) {
+                    $account['cash_balance'] = $decryptedBalance;
+                }
+            }
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -175,7 +217,7 @@ $portfolioStmt->execute([':user_id' => $userId]);
 $portfolio = $portfolioStmt->fetchAll();
 
 $tradeHistoryStmt = $pdo->prepare(
-    'SELECT symbol, trade_type, quantity, price, total_amount, status, created_at
+    'SELECT symbol, trade_type, quantity, price, price_enc, total_amount, total_amount_enc, status, created_at
      FROM trades
      WHERE user_id = :user_id
      ORDER BY created_at DESC
@@ -330,13 +372,28 @@ $recentTrades = $tradeHistoryStmt->fetchAll();
                 <tr><td colspan="7">No trades yet.</td></tr>
             <?php else: ?>
                 <?php foreach ($recentTrades as $row): ?>
+                    <?php
+                        $displayPrice = !empty($row['price_enc'])
+                            ? decrypt_numeric_float_value((string) $row['price_enc'])
+                            : (float) $row['price'];
+                        if ($displayPrice === null) {
+                            $displayPrice = (float) $row['price'];
+                        }
+
+                        $displayTotal = !empty($row['total_amount_enc'])
+                            ? decrypt_numeric_float_value((string) $row['total_amount_enc'])
+                            : (float) $row['total_amount'];
+                        if ($displayTotal === null) {
+                            $displayTotal = (float) $row['total_amount'];
+                        }
+                    ?>
                     <tr>
                         <td><?= e((string) $row['created_at']) ?></td>
                         <td><?= e((string) $row['symbol']) ?></td>
                         <td><?= e(strtoupper((string) $row['trade_type'])) ?></td>
                         <td class="right"><?= (int) $row['quantity'] ?></td>
-                        <td class="right">£<?= number_format((float) $row['price'], 2) ?></td>
-                        <td class="right">£<?= number_format((float) $row['total_amount'], 2) ?></td>
+                        <td class="right">£<?= number_format((float) $displayPrice, 2) ?></td>
+                        <td class="right">£<?= number_format((float) $displayTotal, 2) ?></td>
                         <td><?= e((string) $row['status']) ?></td>
                     </tr>
                 <?php endforeach; ?>
