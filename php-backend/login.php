@@ -104,10 +104,13 @@ if (is_post()) {
                 $stmt = $pdo->prepare(
                     'SELECT id, username, email, password_hash, role, two_factor_enabled, totp_secret_enc, failed_login_attempts, locked_until
                      FROM users
-                     WHERE username = :identifier OR email = :identifier
+                     WHERE username = :identifier_username OR email = :identifier_email
                      LIMIT 1'
                 );
-                $stmt->execute([':identifier' => $identifier]);
+                $stmt->execute([
+                    ':identifier_username' => $identifier,
+                    ':identifier_email' => $identifier,
+                ]);
                 $user = $stmt->fetch();
 
                 if (!$user) {
